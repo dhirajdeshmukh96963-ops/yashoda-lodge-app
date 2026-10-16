@@ -1,7 +1,6 @@
 'use client';
 
 import React, { useState, useEffect, useRef } from 'react';
-import { createWorker } from 'tesseract.js';
 import Navigation from '@/components/Navigation';
 
 interface GuestRecord {
@@ -19,72 +18,51 @@ interface GuestRecord {
 
 const TOTAL_ROOMS = ['101', '102', '103', '104', '201', '202', '203', '204'];
 
-async function downscaleAndRotate(src: string, rotationDeg = 0, max = 1400): Promise<string> {
-  return new Promise((resolve) => {
-    const img = new Image();
-    img.src = src;
-    img.onload = () => {
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+async function downscaleAndRotate(fileOrBlob: Blob, rotationDeg = 0, max = 1400): Promise<string> {
+  // Resize/rotate using createImageBitmap + canvas.toBlob to avoid synchronous toDataURL and expensive per-pixel JS loops.
+  const imgBitmap = await createImageBitmap(fileOrBlob);
+  let width = imgBitmap.width;
+  let height = imgBitmap.height;
 
-      let width = img.width;
-      let height = img.height;
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d')!;
 
-      if (rotationDeg === 90 || rotationDeg === 270) {
-        canvas.width = height;
-        canvas.height = width;
-      } else {
-        canvas.width = width;
-        canvas.height = height;
-      }
+  if (rotationDeg === 90 || rotationDeg === 270) {
+    canvas.width = height;
+    canvas.height = width;
+  } else {
+    canvas.width = width;
+    canvas.height = height;
+  }
 
-      ctx.save();
-      ctx.translate(canvas.width / 2, canvas.height / 2);
-      ctx.rotate((rotationDeg * Math.PI) / 180);
-      ctx.drawImage(img, -width / 2, -height / 2);
-      ctx.restore();
+  ctx.save();
+  ctx.translate(canvas.width / 2, canvas.height / 2);
+  ctx.rotate((rotationDeg * Math.PI) / 180);
+  ctx.drawImage(imgBitmap, -width / 2, -height / 2);
+  ctx.restore();
 
-      const scale = Math.min(1, max / Math.max(canvas.width, canvas.height));
-      const targetW = Math.round(canvas.width * scale);
-      const targetH = Math.round(canvas.height * scale);
+  const scale = Math.min(1, max / Math.max(canvas.width, canvas.height));
+  const targetW = Math.round(canvas.width * scale);
+  const targetH = Math.round(canvas.height * scale);
 
-      const finalCanvas = document.createElement('canvas');
-      finalCanvas.width = targetW;
-      finalCanvas.height = targetH;
-      const fCtx = finalCanvas.getContext('2d', { willReadFrequently: true })!;
-      fCtx.drawImage(canvas, 0, 0, targetW, targetH);
+  let finalCanvas = canvas;
+  if (targetW !== canvas.width || targetH !== canvas.height) {
+    finalCanvas = document.createElement('canvas');
+    finalCanvas.width = targetW;
+    finalCanvas.height = targetH;
+    const fCtx = finalCanvas.getContext('2d')!;
+    fCtx.drawImage(canvas, 0, 0, targetW, targetH);
+  }
 
-      const imgData = fCtx.getImageData(0, 0, targetW, targetH);
-      const data = imgData.data;
-      const contrast = 1.4;
-      const intercept = 128 * (1 - contrast);
+  const blob: Blob | null = await new Promise((resolve) => finalCanvas.toBlob(resolve, 'image/jpeg', 0.9));
+  if (!blob) throw new Error('Failed to convert canvas to blob');
 
-      for (let i = 0; i < data.length; i += 4) {
-        let gray = data[i] * 0.3 + data[i + 1] * 0.59 + data[i + 2] * 0.11;
-        gray = gray * contrast + intercept;
-        gray = gray < 0 ? 0 : gray > 255 ? 255 : gray;
-        data[i] = gray;
-        data[i + 1] = gray;
-        data[i + 2] = gray;
-      }
-      fCtx.putImageData(imgData, 0, 0);
-
-      resolve(finalCanvas.toDataURL('image/jpeg', 0.90));
-    };
-  });
+  // Return an object URL for preview (much cheaper than base64 data URLs and doesn't bloat localStorage).
+  return URL.createObjectURL(blob);
 }
-
-const readFile = (file: File) =>
-  new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
 
 export default function CheckInPage() {
   const [records, setRecords] = useState<GuestRecord[]>([]);
-  
   const [selectedRoom, setSelectedRoom] = useState<string>('101');
   const [idType, setIdType] = useState<string>('Aadhaar Card');
   const [name, setName] = useState<string>('');
@@ -93,7 +71,7 @@ export default function CheckInPage() {
   const [address, setAddress] = useState<string>('');
   const [purpose, setPurpose] = useState<string>('Tourism / Leisure');
 
-  const [frontPhoto, setFrontPhoto] = useState<string | null>(null);
+  const [frontPhoto, setFrontPhoto] = useState<string | null>(null); // object URLs
   const [backPhoto, setBackPhoto] = useState<string | null>(null);
   const [scanningSide, setScanningSide] = useState<string | null>(null);
   const [ocrStatus, setOcrStatus] = useState<string>('Ready to scan');
@@ -121,23 +99,43 @@ export default function CheckInPage() {
       window.removeEventListener('online', goOnline);
       window.removeEventListener('offline', goOffline);
       if (workerRef.current) {
-        workerRef.current.terminate();
+        workerRef.current.terminate?.();
         workerRef.current = null;
       }
+      // Revoke any created object URLs
+      if (frontPhoto) {
+        try { URL.revokeObjectURL(frontPhoto); } catch (e) { /* ignore */ }
+      }
+      if (backPhoto) {
+        try { URL.revokeObjectURL(backPhoto); } catch (e) { /* ignore */ }
+      }
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const saveRecordsToStorage = (updated: GuestRecord[]) => {
     setRecords(updated);
-    localStorage.setItem('yashoda_guest_records', JSON.stringify(updated));
+    // Keep storage writes small and synchronous-ish (records don't include images anymore).
+    try {
+      localStorage.setItem('yashoda_guest_records', JSON.stringify(updated));
+    } catch (e) {
+      console.error('Failed to save records', e);
+    }
   };
 
   const getOrCreateWorker = async () => {
     if (workerRef.current) return workerRef.current;
     setOcrStatus('Loading Local OCR Engine...');
     try {
-      const worker = await createWorker('eng', 1, { langPath: '/tessdata' });
+      // Dynamically import tesseract to avoid bundling it into the initial payload
+      const tesseract = await import('tesseract.js');
+      const { createWorker } = tesseract;
+      const worker = createWorker({ langPath: '/tessdata' });
       workerRef.current = worker;
+      // explicit load/init sequence
+      await worker.load();
+      await worker.loadLanguage('eng');
+      await worker.initialize('eng');
       setOcrStatus('🟢 OCR Ready');
       return worker;
     } catch (error) {
@@ -150,36 +148,65 @@ export default function CheckInPage() {
   const handleFrontUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const processed = await downscaleAndRotate(await readFile(file), 0);
-    setFrontPhoto(processed);
-    e.target.value = '';
-    await scanFrontCard(processed);
+    const prev = frontPhoto;
+    try {
+      const objectUrl = await downscaleAndRotate(file, 0);
+      if (prev) try { URL.revokeObjectURL(prev); } catch (e) {}
+      setFrontPhoto(objectUrl);
+      e.target.value = '';
+      await scanFrontCard(objectUrl);
+    } catch (err) {
+      console.error('Failed processing front image', err);
+      setOcrStatus('❌ Front processing failed');
+    }
   };
 
   const handleRotateFront = async () => {
     if (!frontPhoto) return;
-    const rotated = await downscaleAndRotate(frontPhoto, 90);
-    setFrontPhoto(rotated);
-    await scanFrontCard(rotated);
+    const prev = frontPhoto;
+    try {
+      // fetch the current object URL and rotate the blob
+      const resp = await fetch(frontPhoto);
+      const blob = await resp.blob();
+      const rotatedUrl = await downscaleAndRotate(blob, 90);
+      if (prev) try { URL.revokeObjectURL(prev); } catch (e) {}
+      setFrontPhoto(rotatedUrl);
+      await scanFrontCard(rotatedUrl);
+    } catch (err) {
+      console.error('Rotate failed', err);
+      setOcrStatus('❌ Rotate failed');
+    }
   };
 
   const handleBackUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const processed = await downscaleAndRotate(await readFile(file), 0);
-    setBackPhoto(processed);
-    e.target.value = '';
-    await scanBackCard(processed);
+    const prev = backPhoto;
+    try {
+      const objectUrl = await downscaleAndRotate(file, 0);
+      if (prev) try { URL.revokeObjectURL(prev); } catch (e) {}
+      setBackPhoto(objectUrl);
+      e.target.value = '';
+      await scanBackCard(objectUrl);
+    } catch (err) {
+      console.error('Failed processing back image', err);
+      setOcrStatus('❌ Back processing failed');
+    }
   };
 
-  const scanFrontCard = async (base64Image: string) => {
+  const scanFrontCard = async (imageUrlOrBlob: string | Blob) => {
     setScanningSide('front');
     setOcrStatus('Scanning Front Card...');
     try {
       const worker = await getOrCreateWorker();
-      const ret = await worker.recognize(base64Image);
+      let input: any = imageUrlOrBlob;
+      if (typeof imageUrlOrBlob === 'string') {
+        const resp = await fetch(imageUrlOrBlob);
+        input = await resp.blob();
+      }
+      const ret = await worker.recognize(input);
       const text = ret.data.text || '';
-      const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+      const lines = text.split('\n').map((l: string) => l.trim()).filter(Boolean);
 
       let detectedId = '';
       if (idType === 'PAN Card') {
@@ -191,7 +218,7 @@ export default function CheckInPage() {
       }
 
       let detectedDob = '';
-      const dobIdx = lines.findIndex((l) => /DOB|Birth|YOB/i.test(l));
+      const dobIdx = lines.findIndex((l: string) => /DOB|Birth|YOB/i.test(l));
       if (dobIdx !== -1) {
         const dm = lines[dobIdx].match(/\b\d{2}[\/\-]\d{2}[\/\-]\d{4}\b/);
         if (dm) detectedDob = dm[0];
@@ -212,7 +239,7 @@ export default function CheckInPage() {
         }
       }
       if (!detectedName) {
-        const clean = lines.filter((l) => /^[A-Za-z\s]{3,30}\$/.test(l) && !/GOVERNMENT|INDIA|UIDAI/i.test(l));
+        const clean = lines.filter((l: string) => /^[A-Za-z\s]{3,30}\$/.test(l) && !/GOVERNMENT|INDIA|UIDAI/i.test(l));
         if (clean.length > 0) detectedName = clean[0].trim();
       }
 
@@ -228,21 +255,26 @@ export default function CheckInPage() {
     }
   };
 
-  const scanBackCard = async (base64Image: string) => {
+  const scanBackCard = async (imageUrlOrBlob: string | Blob) => {
     setScanningSide('back');
     setOcrStatus('Scanning Back Card...');
     try {
       const worker = await getOrCreateWorker();
-      const ret = await worker.recognize(base64Image);
+      let input: any = imageUrlOrBlob;
+      if (typeof imageUrlOrBlob === 'string') {
+        const resp = await fetch(imageUrlOrBlob);
+        input = await resp.blob();
+      }
+      const ret = await worker.recognize(input);
       const text = ret.data.text || '';
-      const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+      const lines = text.split('\n').map((l: string) => l.trim()).filter(Boolean);
 
       let detectedAddr = '';
-      const addrIdx = lines.findIndex((l) => /Address[:]?/i.test(l));
+      const addrIdx = lines.findIndex((l: string) => /Address[:]?/i.test(l));
       if (addrIdx !== -1) {
         detectedAddr = lines.slice(addrIdx, addrIdx + 4).join(', ').replace(/Address[:]?/i, '').trim();
       } else {
-        const pinIdx = lines.findIndex((l) => /\b\d{6}\b/.test(l));
+        const pinIdx = lines.findIndex((l: string) => /\b\d{6}\b/.test(l));
         if (pinIdx !== -1) {
           detectedAddr = lines.slice(Math.max(0, pinIdx - 3), pinIdx + 1).join(', ');
         } else {
@@ -283,11 +315,13 @@ export default function CheckInPage() {
     const updated = [newRecord, ...records.filter(r => r.roomNumber !== selectedRoom || r.status === 'Checked-Out')];
     saveRecordsToStorage(updated);
     alert(`Successfully checked in ${name} to Room ${selectedRoom}!`);
-    
+
     setName('');
     setIdNumber('');
     setDob('');
     setAddress('');
+    if (frontPhoto) { try { URL.revokeObjectURL(frontPhoto); } catch (e) {} }
+    if (backPhoto) { try { URL.revokeObjectURL(backPhoto); } catch (e) {} }
     setFrontPhoto(null);
     setBackPhoto(null);
   };
@@ -356,7 +390,7 @@ export default function CheckInPage() {
               <div className="space-y-1">
                 <div className="relative rounded border overflow-hidden aspect-[4/3] bg-black">
                   <img src={frontPhoto} className="size-full object-cover" alt="front preview" />
-                  <button type="button" onClick={() => setFrontPhoto(null)} className="absolute top-1 right-1 bg-red-600 text-white rounded-full w-4 h-4 text-[10px] flex items-center justify-center">×</button>
+                  <button type="button" onClick={() => { if (frontPhoto) { try { URL.revokeObjectURL(frontPhoto); } catch (e) {} } setFrontPhoto(null); }} className="absolute top-1 right-1 bg-red-600 text-white rounded-full w-4 h-4 text-[10px] flex items-center justify-center">✕</button>
                 </div>
                 <button type="button" onClick={handleRotateFront} className="w-full bg-amber-50 text-amber-800 border border-amber-200 rounded py-1 text-[11px] font-semibold">
                   🔄 Rotate 90°
@@ -375,7 +409,7 @@ export default function CheckInPage() {
             {backPhoto && (
               <div className="relative rounded border overflow-hidden aspect-[4/3] bg-black">
                 <img src={backPhoto} className="size-full object-cover" alt="back preview" />
-                <button type="button" onClick={() => setBackPhoto(null)} className="absolute top-1 right-1 bg-red-600 text-white rounded-full w-4 h-4 text-[10px] flex items-center justify-center">×</button>
+                <button type="button" onClick={() => { if (backPhoto) { try { URL.revokeObjectURL(backPhoto); } catch (e) {} } setBackPhoto(null); }} className="absolute top-1 right-1 bg-red-600 text-white rounded-full w-4 h-4 text-[10px] flex items-center justify-center">✕</button>
               </div>
             )}
           </div>
@@ -394,7 +428,7 @@ export default function CheckInPage() {
           </div>
           <div>
             <label className="block text-sm font-semibold text-gray-700">ID / National ID Number *</label>
-            <input type="text" value={idNumber} onChange={(e) => setIdNumber(e.target.value)} required placeholder="Type or scan ID number" className="w-full mt-1 border border-gray-300 p-2 rounded-md font-medium" />
+            <input type="text" value={idNumber} onChange={(e) => setIdNumber(e.target.value)} required placeholder="Type or scan ID number" className="w-full mt-1 border border-gray-300 p-2 rounded-md" />
           </div>
           <div>
             <label className="block text-sm font-semibold text-gray-700">Date of Birth</label>
