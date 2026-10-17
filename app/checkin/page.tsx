@@ -1,9 +1,11 @@
 'use client';
 
 import React, { useState, useEffect, useRef } from 'react';
+import { createWorker } from 'tesseract.js';
 import Navigation from '@/components/Navigation';
+import { loadGuestRecords, saveGuestRecords, type GuestRecord } from '@/lib/guest-store';
 
-interface GuestRecord {
+interface GuestRecordFormState {
   id: string;
   roomNumber: string;
   name: string;
@@ -18,48 +20,36 @@ interface GuestRecord {
 
 const TOTAL_ROOMS = ['101', '102', '103', '104', '201', '202', '203', '204'];
 
-async function downscaleAndRotate(fileOrBlob: Blob, rotationDeg = 0, max = 1400): Promise<string> {
-  // Resize/rotate using createImageBitmap + canvas.toBlob to avoid synchronous toDataURL and expensive per-pixel JS loops.
-  const imgBitmap = await createImageBitmap(fileOrBlob);
-  let width = imgBitmap.width;
-  let height = imgBitmap.height;
+const processImageInWorker = (blob: Blob, rotationDeg = 0, max = 1400): Promise<Blob> => {
+  return new Promise((resolve, reject) => {
+    if (typeof window === 'undefined' || !('Worker' in window)) {
+      reject(new Error('Web Workers are not available in this browser.'));
+      return;
+    }
 
-  const canvas = document.createElement('canvas');
-  const ctx = canvas.getContext('2d')!;
+    const worker = new Worker('/image-worker.js');
+    const handleMessage = (event: MessageEvent) => {
+      const data = event.data || {};
+      worker.removeEventListener('message', handleMessage);
+      worker.removeEventListener('error', handleError);
+      if (data.type === 'processed' && data.blob) {
+        resolve(data.blob);
+      } else {
+        reject(new Error(data.error || 'Image processing failed'));
+      }
+    };
 
-  if (rotationDeg === 90 || rotationDeg === 270) {
-    canvas.width = height;
-    canvas.height = width;
-  } else {
-    canvas.width = width;
-    canvas.height = height;
-  }
+    const handleError = (event: ErrorEvent) => {
+      worker.removeEventListener('message', handleMessage);
+      worker.removeEventListener('error', handleError);
+      reject(event.error || new Error('Image worker failed'));
+    };
 
-  ctx.save();
-  ctx.translate(canvas.width / 2, canvas.height / 2);
-  ctx.rotate((rotationDeg * Math.PI) / 180);
-  ctx.drawImage(imgBitmap, -width / 2, -height / 2);
-  ctx.restore();
-
-  const scale = Math.min(1, max / Math.max(canvas.width, canvas.height));
-  const targetW = Math.round(canvas.width * scale);
-  const targetH = Math.round(canvas.height * scale);
-
-  let finalCanvas = canvas;
-  if (targetW !== canvas.width || targetH !== canvas.height) {
-    finalCanvas = document.createElement('canvas');
-    finalCanvas.width = targetW;
-    finalCanvas.height = targetH;
-    const fCtx = finalCanvas.getContext('2d')!;
-    fCtx.drawImage(canvas, 0, 0, targetW, targetH);
-  }
-
-  const blob: Blob | null = await new Promise((resolve) => finalCanvas.toBlob(resolve, 'image/jpeg', 0.9));
-  if (!blob) throw new Error('Failed to convert canvas to blob');
-
-  // Return an object URL for preview (much cheaper than base64 data URLs and doesn't bloat localStorage).
-  return URL.createObjectURL(blob);
-}
+    worker.addEventListener('message', handleMessage);
+    worker.addEventListener('error', handleError);
+    worker.postMessage({ blob, rotationDeg, max });
+  });
+};
 
 export default function CheckInPage() {
   const [records, setRecords] = useState<GuestRecord[]>([]);
@@ -71,7 +61,7 @@ export default function CheckInPage() {
   const [address, setAddress] = useState<string>('');
   const [purpose, setPurpose] = useState<string>('Tourism / Leisure');
 
-  const [frontPhoto, setFrontPhoto] = useState<string | null>(null); // object URLs
+  const [frontPhoto, setFrontPhoto] = useState<string | null>(null);
   const [backPhoto, setBackPhoto] = useState<string | null>(null);
   const [scanningSide, setScanningSide] = useState<string | null>(null);
   const [ocrStatus, setOcrStatus] = useState<string>('Ready to scan');
@@ -86,56 +76,33 @@ export default function CheckInPage() {
     window.addEventListener('online', goOnline);
     window.addEventListener('offline', goOffline);
 
-    const saved = localStorage.getItem('yashoda_guest_records');
-    if (saved) {
-      try {
-        setRecords(JSON.parse(saved));
-      } catch (e) {
-        console.error('Failed to parse saved records', e);
-      }
-    }
+    loadGuestRecords()
+      .then((saved) => setRecords(saved))
+      .catch((error) => console.error('Failed to load saved records', error));
 
     return () => {
       window.removeEventListener('online', goOnline);
       window.removeEventListener('offline', goOffline);
       if (workerRef.current) {
-        workerRef.current.terminate?.();
+        workerRef.current.terminate();
         workerRef.current = null;
       }
-      // Revoke any created object URLs
-      if (frontPhoto) {
-        try { URL.revokeObjectURL(frontPhoto); } catch (e) { /* ignore */ }
-      }
-      if (backPhoto) {
-        try { URL.revokeObjectURL(backPhoto); } catch (e) { /* ignore */ }
-      }
+      if (frontPhoto) URL.revokeObjectURL(frontPhoto);
+      if (backPhoto) URL.revokeObjectURL(backPhoto);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const saveRecordsToStorage = (updated: GuestRecord[]) => {
     setRecords(updated);
-    // Keep storage writes small and synchronous-ish (records don't include images anymore).
-    try {
-      localStorage.setItem('yashoda_guest_records', JSON.stringify(updated));
-    } catch (e) {
-      console.error('Failed to save records', e);
-    }
+    saveGuestRecords(updated).catch((error) => console.error('Failed to save records', error));
   };
 
   const getOrCreateWorker = async () => {
     if (workerRef.current) return workerRef.current;
     setOcrStatus('Loading Local OCR Engine...');
     try {
-      // Dynamically import tesseract to avoid bundling it into the initial payload
-      const tesseract = await import('tesseract.js');
-      const { createWorker } = tesseract;
-      const worker = createWorker({ langPath: '/tessdata' });
+      const worker = await createWorker('eng', 1, { langPath: '/tessdata' });
       workerRef.current = worker;
-      // explicit load/init sequence
-      await worker.load();
-      await worker.loadLanguage('eng');
-      await worker.initialize('eng');
       setOcrStatus('🟢 OCR Ready');
       return worker;
     } catch (error) {
@@ -148,10 +115,11 @@ export default function CheckInPage() {
   const handleFrontUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const prev = frontPhoto;
+    const previousFront = frontPhoto;
     try {
-      const objectUrl = await downscaleAndRotate(file, 0);
-      if (prev) try { URL.revokeObjectURL(prev); } catch (e) {}
+      const blob = await processImageInWorker(file, 0, 1400);
+      const objectUrl = URL.createObjectURL(blob);
+      if (previousFront) URL.revokeObjectURL(previousFront);
       setFrontPhoto(objectUrl);
       e.target.value = '';
       await scanFrontCard(objectUrl);
@@ -163,13 +131,12 @@ export default function CheckInPage() {
 
   const handleRotateFront = async () => {
     if (!frontPhoto) return;
-    const prev = frontPhoto;
     try {
-      // fetch the current object URL and rotate the blob
       const resp = await fetch(frontPhoto);
       const blob = await resp.blob();
-      const rotatedUrl = await downscaleAndRotate(blob, 90);
-      if (prev) try { URL.revokeObjectURL(prev); } catch (e) {}
+      const processedBlob = await processImageInWorker(blob, 90, 1400);
+      const rotatedUrl = URL.createObjectURL(processedBlob);
+      if (frontPhoto) URL.revokeObjectURL(frontPhoto);
       setFrontPhoto(rotatedUrl);
       await scanFrontCard(rotatedUrl);
     } catch (err) {
@@ -181,10 +148,11 @@ export default function CheckInPage() {
   const handleBackUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const prev = backPhoto;
+    const previousBack = backPhoto;
     try {
-      const objectUrl = await downscaleAndRotate(file, 0);
-      if (prev) try { URL.revokeObjectURL(prev); } catch (e) {}
+      const blob = await processImageInWorker(file, 0, 1400);
+      const objectUrl = URL.createObjectURL(blob);
+      if (previousBack) URL.revokeObjectURL(previousBack);
       setBackPhoto(objectUrl);
       e.target.value = '';
       await scanBackCard(objectUrl);
@@ -320,8 +288,8 @@ export default function CheckInPage() {
     setIdNumber('');
     setDob('');
     setAddress('');
-    if (frontPhoto) { try { URL.revokeObjectURL(frontPhoto); } catch (e) {} }
-    if (backPhoto) { try { URL.revokeObjectURL(backPhoto); } catch (e) {} }
+    if (frontPhoto) URL.revokeObjectURL(frontPhoto);
+    if (backPhoto) URL.revokeObjectURL(backPhoto);
     setFrontPhoto(null);
     setBackPhoto(null);
   };
@@ -379,7 +347,6 @@ export default function CheckInPage() {
         </div>
 
         <div className="grid grid-cols-2 gap-3">
-          {/* Front Side */}
           <div className="space-y-2">
             <label className="flex flex-col items-center justify-center p-3 border-2 border-dashed border-teal-600 rounded-lg cursor-pointer bg-teal-50 hover:bg-teal-100">
               <span className="text-xs font-bold text-teal-800">🪪 Front Card</span>
@@ -390,7 +357,7 @@ export default function CheckInPage() {
               <div className="space-y-1">
                 <div className="relative rounded border overflow-hidden aspect-[4/3] bg-black">
                   <img src={frontPhoto} className="size-full object-cover" alt="front preview" />
-                  <button type="button" onClick={() => { if (frontPhoto) { try { URL.revokeObjectURL(frontPhoto); } catch (e) {} } setFrontPhoto(null); }} className="absolute top-1 right-1 bg-red-600 text-white rounded-full w-4 h-4 text-[10px] flex items-center justify-center">✕</button>
+                  <button type="button" onClick={() => { if (frontPhoto) URL.revokeObjectURL(frontPhoto); setFrontPhoto(null); }} className="absolute top-1 right-1 bg-red-600 text-white rounded-full w-4 h-4 text-[10px] flex items-center justify-center">✕</button>
                 </div>
                 <button type="button" onClick={handleRotateFront} className="w-full bg-amber-50 text-amber-800 border border-amber-200 rounded py-1 text-[11px] font-semibold">
                   🔄 Rotate 90°
@@ -399,7 +366,6 @@ export default function CheckInPage() {
             )}
           </div>
 
-          {/* Back Side */}
           <div className="space-y-2">
             <label className="flex flex-col items-center justify-center p-3 border-2 border-dashed border-indigo-600 rounded-lg cursor-pointer bg-indigo-50 hover:bg-indigo-100">
               <span className="text-xs font-bold text-indigo-800">🏠 Back Card</span>
@@ -409,7 +375,7 @@ export default function CheckInPage() {
             {backPhoto && (
               <div className="relative rounded border overflow-hidden aspect-[4/3] bg-black">
                 <img src={backPhoto} className="size-full object-cover" alt="back preview" />
-                <button type="button" onClick={() => { if (backPhoto) { try { URL.revokeObjectURL(backPhoto); } catch (e) {} } setBackPhoto(null); }} className="absolute top-1 right-1 bg-red-600 text-white rounded-full w-4 h-4 text-[10px] flex items-center justify-center">✕</button>
+                <button type="button" onClick={() => { if (backPhoto) URL.revokeObjectURL(backPhoto); setBackPhoto(null); }} className="absolute top-1 right-1 bg-red-600 text-white rounded-full w-4 h-4 text-[10px] flex items-center justify-center">✕</button>
               </div>
             )}
           </div>
@@ -456,3 +422,179 @@ export default function CheckInPage() {
     </div>
   );
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

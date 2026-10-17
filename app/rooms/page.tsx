@@ -3,14 +3,7 @@
 import React, { useState, useEffect } from 'react';
 import Navigation from '@/components/Navigation';
 import { useRouter } from 'next/navigation';
-
-interface GuestRecord {
-  id: string;
-  roomNumber: string;
-  name: string;
-  idNumber: string;
-  status: 'Checked-In' | 'Checked-Out';
-}
+import { loadGuestRecords, saveGuestRecords, type GuestRecord } from '@/lib/guest-store';
 
 const TOTAL_ROOMS = ['101', '102', '103', '104', '201', '202', '203', '204'];
 
@@ -19,20 +12,15 @@ export default function RoomsPage() {
   const router = useRouter();
 
   useEffect(() => {
-    const saved = localStorage.getItem('yashoda_guest_records');
-    if (saved) {
-      try {
-        setRecords(JSON.parse(saved));
-      } catch (e) {
-        console.error(e);
-      }
-    }
+    loadGuestRecords()
+      .then(setRecords)
+      .catch((error) => console.error('Failed to load records', error));
   }, []);
 
   const handleCheckout = (recordId: string) => {
     const updated = records.map(r => r.id === recordId ? { ...r, status: 'Checked-Out' as const } : r);
     setRecords(updated);
-    localStorage.setItem('yashoda_guest_records', JSON.stringify(updated));
+    saveGuestRecords(updated).catch((error) => console.error('Failed to save updated records', error));
   };
 
   const activeOccupants = records.filter(r => r.status === 'Checked-In');
